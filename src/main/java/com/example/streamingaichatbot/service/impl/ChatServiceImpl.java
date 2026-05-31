@@ -25,6 +25,10 @@ import java.util.concurrent.atomic.AtomicReference;
 @RequiredArgsConstructor
 public class ChatServiceImpl implements ChatService {
 
+    // Spring AI autoconfigures this from application.properties.
+    // Using the ChatModel interface (not OpenAiChatModel directly)
+    // keeps the service provider-agnostic — later when you add Gemini
+    // you won't need to touch this file at all.
     private final ChatModel chatModel;
     private final ConversationHistoryStore historyStore;
 
@@ -47,8 +51,9 @@ public class ChatServiceImpl implements ChatService {
         AtomicReference<StringBuilder> buffer = new AtomicReference<>(new StringBuilder());
 
         return chatModel.stream(prompt)
-                .map(response -> {
-                    // Extract token text from Spring AI response
+                .flatMap(response -> {
+                    // flatMap lets us return empty Flux for null tokens
+                    // instead of returning null from map() which Reactor rejects
                     String token = "";
                     try {
                         if (response.getResult() != null
@@ -61,11 +66,12 @@ public class ChatServiceImpl implements ChatService {
                     }
                     if (!token.isEmpty()) {
                         buffer.get().append(token);
-                        return StreamChunk.token(token, sessionId);
+                        return Flux.just(StreamChunk.token(token, sessionId));
                     }
-                    return null;
+                    // Empty chunk from OpenAI (e.g. role/finish_reason chunks)
+                    // — return empty Flux instead of null
+                    return Flux.empty();
                 })
-                .filter(chunk -> chunk != null)
                 .concatWith(Flux.just(StreamChunk.done(sessionId)))
                 .doOnComplete(() -> {
                     // 4. Save both turns to history once stream finishes
@@ -111,8 +117,8 @@ public class ChatServiceImpl implements ChatService {
         messages.add(new UserMessage(userMessage));
 
         return new Prompt(messages);
-        // Note: options (model, temp, maxTokens) are already set
-        // in the OpenAiChatModel bean via OpenAiConfig — no need
-        // to repeat them here unless you want per-request overrides.
+        // Options (model, temperature, maxTokens) come from
+        // application.properties → Spring AI autoconfigures them
+        // into the ChatModel bean automatically.
     }
 }
