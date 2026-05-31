@@ -31,29 +31,31 @@ public class ChatServiceImpl implements ChatService {
     // you won't need to touch this file at all.
     private final ChatModel chatModel;
     private final ConversationHistoryStore historyStore;
-
+ 
     private static final String SYSTEM_PROMPT =
             "You are a helpful AI assistant for FlowGen AI, a business automation company. " +
-                    "Answer clearly and concisely. Be friendly and professional.";
-
+            "Answer clearly and concisely. Be friendly and professional.";
+ 
     @Override
     public Flux<StreamChunk> streamChat(ChatRequest request) {
         String sessionId = request.getSessionId();
-
+ 
         // 1. Load existing conversation history
         List<ConversationEntry> history = historyStore.getHistory(sessionId);
         log.info("[ChatService] stream | session={} | historySize={}", sessionId, history.size());
-
+ 
         // 2. Build prompt with full history for context
         Prompt prompt = buildPrompt(request.getMessage(), history);
-
+ 
         // 3. Accumulate tokens so we can save the full response to history
         AtomicReference<StringBuilder> buffer = new AtomicReference<>(new StringBuilder());
-
+ 
+        // Save user message to history IMMEDIATELY before streaming starts.
+        // This way it's already in history even if stream is interrupted.
+        historyStore.addEntry(sessionId, ConversationEntry.user(request.getMessage()));
+ 
         return chatModel.stream(prompt)
                 .flatMap(response -> {
-                    // flatMap lets us return empty Flux for null tokens
-                    // instead of returning null from map() which Reactor rejects
                     String token = "";
                     try {
                         if (response.getResult() != null
@@ -68,18 +70,17 @@ public class ChatServiceImpl implements ChatService {
                         buffer.get().append(token);
                         return Flux.just(StreamChunk.token(token, sessionId));
                     }
-                    // Empty chunk from OpenAI (e.g. role/finish_reason chunks)
-                    // — return empty Flux instead of null
                     return Flux.empty();
                 })
                 .concatWith(Flux.just(StreamChunk.done(sessionId)))
-                .doOnComplete(() -> {
-                    // 4. Save both turns to history once stream finishes
+                .doFinally(signalType -> {
+                    // doFinally fires on complete AND cancel AND error —
+                    // much more reliable than doOnComplete for SSE streams
                     String fullResponse = buffer.get().toString();
                     if (!fullResponse.isBlank()) {
-                        historyStore.addEntry(sessionId, ConversationEntry.user(request.getMessage()));
                         historyStore.addEntry(sessionId, ConversationEntry.assistant(fullResponse));
-                        log.debug("[ChatService] History saved | session={} | chars={}", sessionId, fullResponse.length());
+                        log.debug("[ChatService] History saved | session={} | signal={} | chars={}",
+                                sessionId, signalType, fullResponse.length());
                     }
                 })
                 .onErrorResume(ex -> {
@@ -87,12 +88,12 @@ public class ChatServiceImpl implements ChatService {
                     return Flux.just(StreamChunk.error(ex.getMessage(), sessionId));
                 });
     }
-
+ 
     @Override
     public void clearConversation(String sessionId) {
         historyStore.clearSession(sessionId);
     }
-
+ 
     /**
      * Builds a Spring AI Prompt from conversation history + current message.
      * All Message types (SystemMessage, UserMessage, AssistantMessage)
@@ -100,10 +101,10 @@ public class ChatServiceImpl implements ChatService {
      */
     private Prompt buildPrompt(String userMessage, List<ConversationEntry> history) {
         List<Message> messages = new ArrayList<>();
-
+ 
         // System instruction always first
         messages.add(new SystemMessage(SYSTEM_PROMPT));
-
+ 
         // Past conversation turns
         for (ConversationEntry entry : history) {
             switch (entry.getRole()) {
@@ -112,10 +113,10 @@ public class ChatServiceImpl implements ChatService {
                 case SYSTEM    -> messages.add(new SystemMessage(entry.getContent()));
             }
         }
-
+ 
         // Current user message
         messages.add(new UserMessage(userMessage));
-
+ 
         return new Prompt(messages);
         // Options (model, temperature, maxTokens) come from
         // application.properties → Spring AI autoconfigures them
